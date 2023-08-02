@@ -9,6 +9,7 @@ add_mlir_dialect_library(MLIRAffineTransforms
   LoopCoalescing.cpp
   LoopFusion.cpp
   LoopTiling.cpp
+  LoopPacking.cpp
   LoopUnroll.cpp
   LoopUnrollAndJam.cpp
   PipelineDataTransfer.cpp

@@ -199,6 +199,34 @@ def AffineLoopTiling : Pass<"affine-loop-tile", "func::FuncOp"> {
   ];
 }
 
+def AffineLoopPacking : Pass<"affine-loop-pack", "func::FuncOp"> {
+  let summary =
+      "Apply packing to loop nests for data that is deemed profitable";
+  let constructor = "mlir::affine::createLoopPackingPass()";
+  let dependentDialects = ["memref::MemRefDialect"];
+  let options = [
+    Option<"l1CacheSizeInKiB", "l1-cache-size", "uint64_t", /*default=*/"32",
+           "Set size of L1 cache to pack for in KiB. Default is 32.">,
+    Option<"l2CacheSizeInKiB", "l2-cache-size", "uint64_t", /*default=*/"256",
+           "Set size of L2 cache to pack for in KiB. Default is 256.">,
+    Option<"l3CacheSizeInKiB", "l3-cache-size", "uint64_t", /*default=*/"8192",
+           "Set size of L3 cache to pack for in KiB. Default is 8192.">,
+    Option<"cacheLineSizeInB", "cache-line-size", "uint64_t", /*default=*/"64",
+           "Set size cache line in Bytes. Default is 64.">,
+    Option<
+        "l1dtlbEntries", "l1d-tlb-entries", "uint64_t", /*default=*/"64",
+        "Set the number of entries that the L1 data TLB has. Default is 64.">,
+    Option<"l1dtlbPageSizeInKiB", "l1d-tlb-page-size", "uint64_t",
+           /*default=*/"4",
+           "Set the size of the TLB page in KiB. Default is 4.">,
+    ListOption<"packingOptions", "packing-options", "int",
+               "Manual selection of packing candidates, overrides the cost "
+               "model. Use -1 to only list packing candidates. Select "
+               "candidates by their ID, which starts from 1. (e.g. 1,2).",
+               "llvm::cl::ZeroOrMore">
+  ];
+}
+
 def AffineLoopUnroll : Pass<"affine-loop-unroll", "func::FuncOp"> {
   let summary = "Unroll affine loops";
   let constructor = "mlir::affine::createLoopUnrollPass()";
