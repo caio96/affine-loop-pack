@@ -1863,6 +1863,14 @@ static void getMultiLevelStrides(const MemRefRegion &region,
   }
 }
 
+bool mlir::affine::isInnermostAffineForOp(AffineForOp op) {
+  return !op.getBody()
+              ->walk([&](AffineForOp nestedForOp) {
+                return WalkResult::interrupt();
+              })
+              .wasInterrupted();
+}
+
 /// Generates a point-wise copy from/to `memref' to/from `fastMemRef' and
 /// returns the outermost AffineForOp of the copy loop nest. `lbMaps` and
 /// `ubMaps` along with `lbOperands` and `ubOperands` hold the lower and upper

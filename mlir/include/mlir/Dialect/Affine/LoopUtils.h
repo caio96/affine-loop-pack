@@ -272,6 +272,9 @@ LogicalResult coalesceLoops(MutableArrayRef<AffineForOp> loops);
 void mapLoopToProcessorIds(scf::ForOp forOp, ArrayRef<Value> processorId,
                            ArrayRef<Value> numProcessors);
 
+/// Returns true if no other affine.for ops are nested within `op`.
+bool isInnermostAffineForOp(AffineForOp op);
+
 /// Gathers all AffineForOps in 'func.func' grouped by loop depth.
 void gatherLoops(func::FuncOp func,
                  std::vector<SmallVector<AffineForOp, 2>> &depthToLoops);

@@ -72,15 +72,6 @@ struct LoopUnroll : public affine::impl::AffineLoopUnrollBase<LoopUnroll> {
 };
 } // namespace
 
-/// Returns true if no other affine.for ops are nested within `op`.
-static bool isInnermostAffineForOp(AffineForOp op) {
-  return !op.getBody()
-              ->walk([&](AffineForOp nestedForOp) {
-                return WalkResult::interrupt();
-              })
-              .wasInterrupted();
-}
-
 /// Gathers loops that have no affine.for's nested within.
 static void gatherInnermostLoops(func::FuncOp f,
                                  SmallVectorImpl<AffineForOp> &loops) {
