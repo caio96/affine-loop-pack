@@ -145,22 +145,7 @@ uint64_t mlir::affine::getLargestDivisorOfTripCount(AffineForOp forOp) {
   return *gcd;
 }
 
-/// Given an induction variable `iv` of type AffineForOp and an access `index`
-/// of type index, returns `true` if `index` is independent of `iv` and
-/// false otherwise. The determination supports composition with at most one
-/// AffineApplyOp. The 'at most one AffineApplyOp' comes from the fact that
-/// the composition of AffineApplyOp needs to be canonicalized by construction
-/// to avoid writing code that composes arbitrary numbers of AffineApplyOps
-/// everywhere. To achieve this, at the very least, the compose-affine-apply
-/// pass must have been run.
-///
-/// Prerequisites:
-///   1. `iv` and `index` of the proper type;
-///   2. at most one reachable AffineApplyOp from index;
-///
-/// Returns false in cases with more than one AffineApplyOp, this is
-/// conservative.
-static bool isAccessIndexInvariant(Value iv, Value index) {
+bool mlir::affine::isAccessIndexInvariant(Value iv, Value index) {
   assert(isAffineForInductionVar(iv) && "iv must be a AffineForOp");
   assert(isa<IndexType>(index.getType()) && "index must be of IndexType");
   SmallVector<Operation *, 4> affineApplyOps;
