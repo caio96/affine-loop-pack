@@ -202,6 +202,31 @@ LogicalResult affineDataCopyGenerate(AffineForOp forOp,
                                      std::optional<Value> filterMemRef,
                                      DenseSet<Operation *> &copyNests);
 
+/// Creates a buffer in the faster memory space for the specified memref region;
+/// generates a copy from the lower memory space to this one, and replaces all
+/// loads/stores in the block range [`begin', `end') of `block' to load/store
+/// from that buffer. Returns failure if copies could not be generated due to
+/// yet unimplemented cases. `copyInPlacementStart` and `copyOutPlacementStart`
+/// in copyPlacementBlock specify the insertion points where the incoming copies
+/// and outgoing copies, respectively, should be inserted (the insertion happens
+/// right before the insertion point). Since `begin` can itself be invalidated
+/// due to the memref rewriting done from this method, the output argument
+/// `nBegin` is set to its replacement (set to `begin` if no invalidation
+/// happens). Since outgoing copies could have  been inserted at `end`, the
+/// output argument `nEnd` is set to the new end. `sizeInBytes` is set to the
+/// size of the fast buffer allocated. If `fastBufferPermutationIndex` is passed
+/// the copy will reorder the dimensions (and thus the elements) of the new
+/// buffer based on the order of the indexes in `fastBufferPermutationIndex`,
+/// permutation is only supported if copyOptions.generateDma is false.
+LogicalResult generateCopy(
+    const MemRefRegion &region, Block *block, Block::iterator begin,
+    Block::iterator end, Block *copyPlacementBlock,
+    Block::iterator copyInPlacementStart, Block::iterator copyOutPlacementStart,
+    const AffineCopyOptions &copyOptions, DenseMap<Value, Value> &fastBufferMap,
+    DenseSet<Operation *> &copyNests, uint64_t *sizeInBytes,
+    Block::iterator *nBegin, Block::iterator *nEnd,
+    ArrayRef<size_t> fastBufferPermutationIndex = std::nullopt);
+
 /// Result for calling generateCopyForMemRegion.
 struct CopyGenerateResult {
   // Number of bytes used by alloc.

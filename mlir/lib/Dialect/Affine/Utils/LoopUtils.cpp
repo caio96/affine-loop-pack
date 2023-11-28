@@ -1898,12 +1898,16 @@ bool mlir::affine::isInnermostAffineForOp(AffineForOp op) {
 ///   for y = ...
 ///     fast_buf[x - offset_x][y - offset_y] = memref[x][y]
 ///
+/// If `fastBufferPermutationIndex` is passed the copy will reorder the
+/// dimensions (and thus the elements) of the new buffer based on the order of
+/// the indexes in `fastBufferPermutationIndex.`
 static AffineForOp
 generatePointWiseCopy(Location loc, Value memref, Value fastMemRef,
                       ArrayRef<AffineMap> lbMaps, ArrayRef<Value> lbOperands,
                       ArrayRef<AffineMap> ubMaps, ArrayRef<Value> ubOperands,
                       ArrayRef<AffineExpr> fastBufOffsets, bool isCopyOut,
-                      OpBuilder b) {
+                      OpBuilder b,
+                      ArrayRef<size_t> fastBufferPermutationIndex = std::nullopt) {
   assert(llvm::all_of(lbMaps, [&](AffineMap lbMap) {
     return lbMap.getNumInputs() == lbOperands.size();
   }));
@@ -1944,6 +1948,11 @@ generatePointWiseCopy(Location loc, Value memref, Value fastMemRef,
     memIndices.push_back(forOp.getInductionVar());
   }
 
+  // permute fastBufExprs
+  if (!fastBufferPermutationIndex.empty()) {
+    permuteWithIndexVector(fastBufExprs, fastBufferPermutationIndex);
+  }
+
   auto fastBufMap =
       AffineMap::get(2 * rank, /*symbolCount=*/0, fastBufExprs, b.getContext());
   fullyComposeAffineMapAndOperands(&fastBufMap, &fastBufMapOperands);
@@ -1975,26 +1984,15 @@ emitRemarkForBlock(Block &block) {
   return block.getParentOp()->emitRemark();
 }
 
-/// Creates a buffer in the faster memory space for the specified memref region;
-/// generates a copy from the lower memory space to this one, and replaces all
-/// loads/stores in the block range [`begin', `end') of `block' to load/store
-/// from that buffer. Returns failure if copies could not be generated due to
-/// yet unimplemented cases. `copyInPlacementStart` and `copyOutPlacementStart`
-/// in copyPlacementBlock specify the insertion points where the incoming copies
-/// and outgoing copies, respectively, should be inserted (the insertion happens
-/// right before the insertion point). Since `begin` can itself be invalidated
-/// due to the memref rewriting done from this method, the output argument
-/// `nBegin` is set to its replacement (set to `begin` if no invalidation
-/// happens). Since outgoing copies could have  been inserted at `end`, the
-/// output argument `nEnd` is set to the new end. `sizeInBytes` is set to the
-/// size of the fast buffer allocated.
-static LogicalResult generateCopy(
+LogicalResult mlir::affine::generateCopy(
     const MemRefRegion &region, Block *block, Block::iterator begin,
     Block::iterator end, Block *copyPlacementBlock,
     Block::iterator copyInPlacementStart, Block::iterator copyOutPlacementStart,
     const AffineCopyOptions &copyOptions, DenseMap<Value, Value> &fastBufferMap,
     DenseSet<Operation *> &copyNests, uint64_t *sizeInBytes,
-    Block::iterator *nBegin, Block::iterator *nEnd) {
+    Block::iterator *nBegin, Block::iterator *nEnd,
+    ArrayRef<size_t> fastBufferPermutationIndex) {
+
   *nBegin = begin;
   *nEnd = end;
 
@@ -2048,6 +2046,11 @@ static LogicalResult generateCopy(
   if (!numElements) {
     LLVM_DEBUG(llvm::dbgs() << "Non-constant region size not supported\n");
     return failure();
+  }
+
+  // permute fastBufferShape
+  if (!copyOptions.generateDma && !fastBufferPermutationIndex.empty()) {
+    permuteWithIndexVector(fastBufferShape, fastBufferPermutationIndex);
   }
 
   if (*numElements == 0) {
@@ -2181,7 +2184,8 @@ static LogicalResult generateCopy(
         generatePointWiseCopy(loc, memref, fastMemRef, lbMaps,
                               /*lbOperands=*/regionSymbols, ubMaps,
                               /*ubOperands=*/regionSymbols, fastBufOffsets,
-                              /*isCopyOut=*/region.isWrite(), b);
+                              /*isCopyOut=*/region.isWrite(), b,
+                              fastBufferPermutationIndex);
 
     // Record this so that we can skip it from yet another copy.
     copyNests.insert(copyNest);
@@ -2255,6 +2259,12 @@ static LogicalResult generateCopy(
     auto dimExpr = b.getAffineDimExpr(regionSymbols.size() + i);
     remapExprs.push_back(dimExpr - fastBufOffsets[i]);
   }
+
+  // permute remapExprs
+  if (!copyOptions.generateDma && !fastBufferPermutationIndex.empty()) {
+    permuteWithIndexVector(remapExprs, fastBufferPermutationIndex);
+  }
+
   auto indexRemap = AffineMap::get(regionSymbols.size() + rank, 0, remapExprs,
                                    b.getContext());
 
