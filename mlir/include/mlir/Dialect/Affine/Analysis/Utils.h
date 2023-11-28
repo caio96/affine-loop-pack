@@ -552,8 +552,20 @@ unsigned getNumCommonSurroundingLoops(Operation &a, Operation &b);
 
 /// Gets the memory footprint of all data touched in the specified memory space
 /// in bytes; if the memory space is unspecified, considers all memory spaces.
-std::optional<int64_t> getMemoryFootprintBytes(AffineForOp forOp,
-                                               int memorySpace = -1);
+/// When 'filterMemRef' is specified, only gets footprint of data touched by for
+/// the provided MemRef.
+std::optional<int64_t>
+getMemoryFootprintBytes(Block &block, Block::iterator start,
+                        Block::iterator end, int memorySpace,
+                        std::optional<Value> filterMemRef = std::nullopt);
+
+/// Gets the memory footprint of all data touched in the specified memory space
+/// in bytes; if the memory space is unspecified, considers all memory spaces.
+/// When 'filterMemRef' is specified, only gets footprint of data touched by for
+/// the provided MemRef.
+std::optional<int64_t>
+getMemoryFootprintBytes(AffineForOp forOp, int memorySpace = -1,
+                        std::optional<Value> filterMemRef = std::nullopt);
 
 /// Returns the memref's element type's size in bytes where the elemental type
 /// is an int or float or a vector of such types.

@@ -1906,15 +1906,24 @@ unsigned mlir::affine::getNumCommonSurroundingLoops(Operation &a,
   return numCommonLoops;
 }
 
-static std::optional<int64_t> getMemoryFootprintBytes(Block &block,
-                                                      Block::iterator start,
-                                                      Block::iterator end,
-                                                      int memorySpace) {
+std::optional<int64_t>
+mlir::affine::getMemoryFootprintBytes(Block &block, Block::iterator start,
+                                      Block::iterator end, int memorySpace,
+                                      std::optional<Value> filterMemRef) {
   SmallDenseMap<Value, std::unique_ptr<MemRefRegion>, 4> regions;
 
   // Walk this 'affine.for' operation to gather all memory regions.
   auto result = block.walk(start, end, [&](Operation *opInst) -> WalkResult {
-    if (!isa<AffineReadOpInterface, AffineWriteOpInterface>(opInst)) {
+    // Filter by memrefs if filterMemRef was specified
+    if (auto loadOp = dyn_cast<AffineReadOpInterface>(opInst)) {
+      if (filterMemRef.has_value() && *filterMemRef != loadOp.getMemRef()) {
+        return WalkResult::advance();
+      }
+    } else if (auto storeOp = dyn_cast<AffineWriteOpInterface>(opInst)) {
+      if (filterMemRef.has_value() && *filterMemRef != storeOp.getMemRef()) {
+        return WalkResult::advance();
+      }
+    } else {
       // Neither load nor a store op.
       return WalkResult::advance();
     }
@@ -1950,12 +1959,13 @@ static std::optional<int64_t> getMemoryFootprintBytes(Block &block,
   return totalSizeInBytes;
 }
 
-std::optional<int64_t> mlir::affine::getMemoryFootprintBytes(AffineForOp forOp,
-                                                             int memorySpace) {
+std::optional<int64_t>
+mlir::affine::getMemoryFootprintBytes(AffineForOp forOp, int memorySpace,
+                                      std::optional<Value> filterMemRef) {
   auto *forInst = forOp.getOperation();
   return ::getMemoryFootprintBytes(
       *forInst->getBlock(), Block::iterator(forInst),
-      std::next(Block::iterator(forInst)), memorySpace);
+      std::next(Block::iterator(forInst)), memorySpace, filterMemRef);
 }
 
 /// Returns whether a loop is parallel and contains a reduction loop.
