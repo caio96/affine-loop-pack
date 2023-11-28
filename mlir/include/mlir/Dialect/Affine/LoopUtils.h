@@ -272,6 +272,12 @@ LogicalResult coalesceLoops(MutableArrayRef<AffineForOp> loops);
 void mapLoopToProcessorIds(scf::ForOp forOp, ArrayRef<Value> processorId,
                            ArrayRef<Value> numProcessors);
 
+/// Copy-based permutation of the elements of a SmallVector
+/// permutationIndexes is an index vector with the desired new order.
+template <typename T>
+void permuteWithIndexVector(SmallVectorImpl<T> &array,
+                            ArrayRef<size_t> permutationIndexes);
+
 /// Returns true if no other affine.for ops are nested within `op`.
 bool isInnermostAffineForOp(AffineForOp op);
 

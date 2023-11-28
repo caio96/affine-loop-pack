@@ -1863,6 +1863,19 @@ static void getMultiLevelStrides(const MemRefRegion &region,
   }
 }
 
+template <typename T>
+void mlir::affine::permuteWithIndexVector(SmallVectorImpl<T> &array,
+                                          ArrayRef<size_t> permutationIndexes) {
+  assert(permutationIndexes.size() == array.size() &&
+         "Permutation Buffer has a different size from input array");
+  SmallVector<T> copyArray{array.begin(), array.end()};
+
+  for (size_t i = 0; i < array.size(); i++) {
+    int newIndex = permutationIndexes[i];
+    array[i] = copyArray[newIndex];
+  }
+}
+
 bool mlir::affine::isInnermostAffineForOp(AffineForOp op) {
   return !op.getBody()
               ->walk([&](AffineForOp nestedForOp) {
