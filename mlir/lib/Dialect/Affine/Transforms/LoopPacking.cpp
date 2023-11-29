@@ -12,8 +12,10 @@
 
 #include "mlir/Dialect/Affine/Passes.h"
 
+#include "mlir/Dialect/Affine/Analysis/AffineAnalysis.h"
 #include "mlir/Dialect/Affine/Analysis/LoopAnalysis.h"
 #include "mlir/Dialect/Affine/Analysis/Utils.h"
+#include "mlir/Dialect/Affine/IR/AffineValueMap.h"
 #include "mlir/Dialect/Affine/LoopUtils.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
@@ -225,9 +227,98 @@ public:
   Value memRef;
   /// LoopInfo of target forOp.
   PackingLoopInfo *loop;
+  /// Permutation vector, if it has a value, the packed buffer can be rearranged
+  /// so its data layout correlates better with the current loop order.
+  std::optional<SmallVector<size_t>> permutationOrder;
 
   PackingAttributes(Value memRef, PackingLoopInfo &loop)
       : memRef(memRef), loop(&loop) {}
+
+  void setPermutationOrder() {
+    auto memRefType = this->memRef.getType().cast<MemRefType>();
+    auto rank = memRefType.getRank();
+
+    // Give up on non-trivial layout map.
+    if (!memRefType.getLayout().isIdentity()) {
+      this->permutationOrder = std::nullopt;
+      return;
+    }
+
+    this->loop->forOp.walk([&](Operation *op) {
+      // Get stores and loads related affected by this packing.
+      if (auto loadOp = dyn_cast<AffineLoadOp>(op)) {
+        if (this->memRef != loadOp.getMemRef())
+          return WalkResult::advance();
+      } else if (auto storeOp = dyn_cast<AffineStoreOp>(op)) {
+        if (this->memRef != storeOp.getMemRef())
+          return WalkResult::advance();
+      } else {
+        return WalkResult::advance();
+      }
+
+      // Get access map of load/store.
+      MemRefAccess access(op);
+      AffineValueMap map;
+      access.getAccessMap(&map);
+
+      // Stores the depth of the forOp that owns an IV used as an operand
+      // for each result of the access map. If there are multiple
+      // IVs used as operands to a result, save the depth of the forOp
+      // that is the deepest
+      SmallVector<uint32_t> indexLoopIVDepth;
+      indexLoopIVDepth.reserve(map.getNumResults());
+
+      // For each result of a map expression.
+      for (unsigned int resultIdx = 0; resultIdx < map.getNumResults();
+           resultIdx++) {
+        uint32_t maxNestingDepth = 0;
+        // For every operand of the map (load/store indices).
+        for (auto operand : map.getOperands()) {
+          // If resultIdx^th result is a function of a loop IV,
+          // check the depth of the IV owner and save the max depth
+          if (isAffineForInductionVar(operand) &&
+              map.isFunctionOf(resultIdx, operand)) {
+            AffineForOp ownerForOp = getForInductionVarOwner(operand);
+            maxNestingDepth = std::max(maxNestingDepth, getNestingDepth(ownerForOp));
+          }
+        }
+        // Push back in the order of the results
+        indexLoopIVDepth.push_back(maxNestingDepth);
+      }
+
+      // Create identity permutation
+      SmallVector<size_t> idx;
+      idx.resize(rank);
+      std::iota(idx.begin(), idx.end(), 0);
+
+      // Sort vector of indices idx based on the elements of indexLoopIVDepth.
+      llvm::stable_sort(idx, [&indexLoopIVDepth](size_t i1, size_t i2) {
+        return indexLoopIVDepth[i1] < indexLoopIVDepth[i2];
+      });
+
+      // Initialize permutation order attribute.
+      if (!this->permutationOrder.has_value()) {
+        this->permutationOrder = idx;
+      } else {
+        // If two loads/stores have conflicting permutation orders within this
+        // packing, do not permute.
+        if (this->permutationOrder != idx) {
+          this->permutationOrder = std::nullopt;
+          return WalkResult::interrupt();
+        }
+      }
+      return WalkResult::advance();
+    });
+
+    // Create identity permutation
+    SmallVector<size_t> identity;
+    identity.resize(rank);
+    std::iota(identity.begin(), identity.end(), 0);
+
+    // Set permutationOrder to std::nullopt if no permutation is needed.
+    if (this->permutationOrder == identity)
+      this->permutationOrder = std::nullopt;
+  }
 };
 
 /// Analyse and apply packing to a loop and its nestings.
@@ -288,6 +379,10 @@ void LoopPacking::runOnOuterForOp(AffineForOp outerForOp,
     LLVM_DEBUG(dbgs() << "[DEBUG] Not packing, no invariant loops found.\n");
     return;
   }
+
+  // Check if packing should be permuted.
+  for (auto &packing : packingCandidates)
+    packing.setPermutationOrder();
 }
 
 void LoopPacking::runOnOperation() {
