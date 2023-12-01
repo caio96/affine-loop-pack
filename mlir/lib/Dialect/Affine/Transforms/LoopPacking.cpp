@@ -82,6 +82,51 @@ static std::optional<uint64_t> getApproxTripCount(AffineForOp forOp) {
   return tripCount;
 }
 
+/// Verifies if a memRefRegion is contiguous within a tile.
+/// Given a tile shape, after dropping consecutive outermost dimensions of size
+/// '1', and consecutive innermost dimensions of full size (equal to the memRef
+/// shape), if the resulting shape is >= 2D, i.e. matrix or above, the memref
+/// accesses are not all contiguous within the tile.
+/// For example:
+///         Let memRefShape = [ 128 128 128 ]
+///         Let   tileShape = [   1  32  32 ]
+/// Following the criteria, this function 'trims' the tile shape to [ 32 32 ],
+/// indicating that the tile accesses non-contiguous elements in memory.
+/// i.e. there is a stride between each mult(32) and mult(32)+1 memory access
+/// where mult() represents a multiple of 32.
+static bool isTileShapeContiguous(ArrayRef<int64_t> memRefShape,
+                                  ArrayRef<int64_t> tileShape) {
+  assert(memRefShape.size() == tileShape.size());
+  int32_t begin = 0;
+  int32_t end = memRefShape.size() - 1;
+  int32_t innerDims = 0;
+
+  // 'Drop' the 1's from the outermost dimensions until a non-1 is encountered.
+  while (begin <= end && tileShape[begin] == 1)
+    begin++;
+
+  // If the entire tile is ones then it is a single element access in the
+  // structure and thus contiguous.
+  if (begin == static_cast<int32_t>(memRefShape.size()))
+    return true;
+
+  // 'Drop' the full size dimensions from the innermost dimensions until a
+  // non-full is encountered.
+  // TODO: Handle symbolic values.
+  while (0 <= end && tileShape[end] == memRefShape[end])
+    end--;
+
+  // If the tile shape completely matches the memref region shape then the
+  // accesses are continuous.
+  if (end == -1)
+    return true;
+
+  // After 'dropping' according to the conditions above, if the resulting shape
+  // is not a vector (1D) then the memref accesses are not contiguous.
+  innerDims = end - begin + 1;
+  return innerDims < 2;
+}
+
 /// Given a forOp, this function will collect the memrefs of loads or stores.
 /// Only collects memRefs with rank greater or equal to minRank.
 static void getMemRefsInForOp(AffineForOp forOp, SetVector<Value> &memRefs,
@@ -275,6 +320,26 @@ static void createMemRefRegions(AffineForOp forOp, Value memRef,
   }
 }
 
+/// Get tile shape of memRef given a memRefRegion.
+/// Result is returned in tileShape.
+static void computeTileShape(Value memRef,
+                             std::unique_ptr<MemRefRegion> &region,
+                             llvm::SmallVectorImpl<int64_t> &tileShape) {
+  auto memRefType = memRef.getType().cast<MemRefType>();
+  unsigned rank = memRefType.getRank();
+  tileShape.clear();
+
+  // Compute the extents of the buffer.
+  std::vector<SmallVector<int64_t, 4>> lbs;
+  SmallVector<int64_t, 8> lbDivisors;
+  lbs.reserve(rank);
+  std::optional<int64_t> numElements =
+      region->getConstantBoundingSizeAndShape(&tileShape, &lbs, &lbDivisors);
+  if (!numElements.has_value()) {
+    LLVM_DEBUG(llvm::dbgs() << "Non-constant region size not supported\n");
+  }
+}
+
 /// Stores information of an AffineForOp.
 class PackingLoopInfo {
 public:
@@ -284,6 +349,8 @@ public:
   uint32_t depth;
   /// Constant trip count of forOp
   std::optional<uint64_t> tripCount;
+  /// Map from memref to a it's tile shape in this loop
+  DenseMap<Value, SmallVector<int64_t>> memRefTileShapeMap;
   /// Map from memref to it's read region
   DenseMap<Value, std::unique_ptr<MemRefRegion>> memRefReadRegion;
   /// Map from memref to it's write region
@@ -318,6 +385,22 @@ public:
 
     return this->memRefWriteRegion[memRef];
   }
+
+  /// Returns the tile shape of a memref in this loop if known.
+  /// Otherwise returns an empty array.
+  /// The result is computed only when requested and then stored.
+  ArrayRef<int64_t> getMemRefTileShape(Value memRef) {
+    if (this->memRefTileShapeMap.count(memRef) == 0) {
+      // Using only the read region as the tile shape should be equivalent
+      // for write the region (and we don't have to pack a write only region)
+      auto &region = this->getMemRefReadRegion(memRef);
+      if (region)
+        computeTileShape(memRef, region, this->memRefTileShapeMap[memRef]);
+      else
+        this->memRefTileShapeMap[memRef] = SmallVector<int64_t>();
+    }
+    return this->memRefTileShapeMap[memRef];
+  }
 };
 
 /// Information about a packing candidate.
@@ -335,6 +418,19 @@ public:
 
   PackingAttributes(Value memRef, PackingLoopInfo &loop)
       : memRef(memRef), loop(&loop) {}
+
+  ArrayRef<int64_t> getTileShape() const {
+    return this->loop->getMemRefTileShape(this->memRef);
+  }
+
+  std::optional<bool> isContiguous() const {
+    auto tileShape = this->getTileShape();
+    if (tileShape.empty())
+      return std::nullopt;
+
+    auto memRefShape = this->memRef.getType().cast<MemRefType>().getShape();
+    return isTileShapeContiguous(memRefShape, tileShape);
+  }
 
   std::unique_ptr<MemRefRegion> &getReadRegion() const {
     return this->loop->getMemRefReadRegion(this->memRef);
@@ -514,6 +610,29 @@ void LoopPacking::runOnOuterForOp(AffineForOp outerForOp,
         dbgs() << "[DEBUG] Not packing, could not compute memRef regions.\n");
     return;
   }
+
+  // Remove packing candidates that are contiguous and have no permutation.
+  packingCandidates.erase(
+      std::remove_if(
+          packingCandidates.begin(), packingCandidates.end(),
+          [&](PackingAttributes &attr) {
+            if (!attr.isContiguous().has_value() ||
+                (attr.isContiguous().value() &&
+                 attr.permutationOrder == std::nullopt)) {
+              LLVM_DEBUG(dbgs() << "[DEBUG] Candidate removed: region is contiguous "
+                                   "and has no permutation.\n");
+              return true;
+            }
+            return false;
+          }),
+      packingCandidates.end());
+
+  if (packingCandidates.empty()) {
+    LLVM_DEBUG(dbgs() << "[DEBUG] Not packing, regions are contiguous and have "
+                         "no permutation.\n");
+    return;
+  }
+
 }
 
 void LoopPacking::runOnOperation() {
