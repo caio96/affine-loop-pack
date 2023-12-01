@@ -199,6 +199,82 @@ static bool memRefAccessesInvariantToLoop(AffineForOp forOp, Value memRef) {
   return true;
 }
 
+/// Computes memRefRegions for a memRef within a forOp.
+static void createMemRefRegions(AffineForOp forOp, Value memRef,
+                                std::unique_ptr<MemRefRegion> &readRegion,
+                                std::unique_ptr<MemRefRegion> &writeRegion) {
+  // To check for errors when walking the block.
+  bool error = false;
+  unsigned depth = getNestingDepth(forOp);
+
+  // Walk this range of operations to gather all memory regions.
+  forOp.walk([&](Operation *op) {
+    // Skip ops that are not loads and stores of memRef
+    if (auto loadOp = dyn_cast<AffineLoadOp>(op)) {
+      if (memRef != loadOp.getMemRef())
+        return WalkResult::advance();
+    } else if (auto storeOp = dyn_cast<AffineStoreOp>(op)) {
+      if (memRef != storeOp.getMemRef())
+        return WalkResult::advance();
+    } else {
+      return WalkResult::advance();
+    }
+
+    // Compute the MemRefRegion accessed.
+    auto region = std::make_unique<MemRefRegion>(op->getLoc());
+    if (failed(region->compute(op, depth, /*sliceState=*/nullptr,
+                               /*addMemRefDimBounds=*/false))) {
+      LLVM_DEBUG(dbgs() << "[DEBUG] Error obtaining memory region of " << memRef
+                        << " : semi-affine maps?\n");
+      error = true;
+      return WalkResult::interrupt();
+    }
+
+    // Attempts to update regions
+    auto updateRegion = [&](const std::unique_ptr<MemRefRegion> &targetRegion) {
+      if (!targetRegion) {
+        return;
+      }
+
+      // Perform a union with the existing region.
+      if (failed(targetRegion->unionBoundingBox(*region))) {
+        LLVM_DEBUG(dbgs() << "[DEBUG] Error obtaining memory region of "
+                          << memRef << " : semi-affine maps?\n");
+        error = true;
+        return;
+      }
+      // Union was computed and stored in 'targetRegion': copy to 'region'.
+      region->getConstraints()->clearAndCopyFrom(
+          *targetRegion->getConstraints());
+    };
+
+    // Update region if region already exists.
+    updateRegion(readRegion);
+    if (error)
+      return WalkResult::interrupt();
+    updateRegion(writeRegion);
+    if (error)
+      return WalkResult::interrupt();
+
+    // Add region if region is empty.
+    if (region->isWrite() && !writeRegion) {
+      writeRegion = std::move(region);
+    } else if (!region->isWrite() && !readRegion) {
+      readRegion = std::move(region);
+    }
+
+    return WalkResult::advance();
+  });
+
+  if (error) {
+    Block::iterator begin = Block::iterator(forOp);
+    begin->emitWarning("Creating and updating regions failed in this block\n");
+    // clean regions
+    readRegion = nullptr;
+    writeRegion = nullptr;
+  }
+}
+
 /// Stores information of an AffineForOp.
 class PackingLoopInfo {
 public:
@@ -208,6 +284,10 @@ public:
   uint32_t depth;
   /// Constant trip count of forOp
   std::optional<uint64_t> tripCount;
+  /// Map from memref to it's read region
+  DenseMap<Value, std::unique_ptr<MemRefRegion>> memRefReadRegion;
+  /// Map from memref to it's write region
+  DenseMap<Value, std::unique_ptr<MemRefRegion>> memRefWriteRegion;
 
   PackingLoopInfo() = default;
 
@@ -216,6 +296,28 @@ public:
     this->depth = getNestingDepth(this->forOp) + 1;
     this->tripCount = getApproxTripCount(this->forOp);
   };
+
+  /// Returns the read region of a memref in this loop, if known.
+  /// Otherwise, return a nullptr.
+  /// The result is computed only when requested and then stored.
+  std::unique_ptr<MemRefRegion> &getMemRefReadRegion(Value memRef) {
+    if (this->memRefReadRegion.count(memRef) == 0)
+      createMemRefRegions(this->forOp, memRef, this->memRefReadRegion[memRef],
+                          this->memRefWriteRegion[memRef]);
+
+    return this->memRefReadRegion[memRef];
+  }
+
+  /// Returns the write region of a memref in this loop, if known.
+  /// Otherwise, return a nullptr.
+  /// The result is computed only when requested and then stored.
+  std::unique_ptr<MemRefRegion> &getMemRefWriteRegion(Value memRef) {
+    if (this->memRefWriteRegion.count(memRef) == 0)
+      createMemRefRegions(this->forOp, memRef, this->memRefReadRegion[memRef],
+                          this->memRefWriteRegion[memRef]);
+
+    return this->memRefWriteRegion[memRef];
+  }
 };
 
 /// Information about a packing candidate.
@@ -233,6 +335,14 @@ public:
 
   PackingAttributes(Value memRef, PackingLoopInfo &loop)
       : memRef(memRef), loop(&loop) {}
+
+  std::unique_ptr<MemRefRegion> &getReadRegion() const {
+    return this->loop->getMemRefReadRegion(this->memRef);
+  }
+
+  std::unique_ptr<MemRefRegion> &getWriteRegion() const {
+    return this->loop->getMemRefWriteRegion(this->memRef);
+  }
 
   void setPermutationOrder() {
     auto memRefType = this->memRef.getType().cast<MemRefType>();
@@ -383,6 +493,27 @@ void LoopPacking::runOnOuterForOp(AffineForOp outerForOp,
   // Check if packing should be permuted.
   for (auto &packing : packingCandidates)
     packing.setPermutationOrder();
+
+  // Remove packing options that have no read region (only write)
+  // or that could not compute memRef read regions.
+  // Only write regions are not considered for packing.
+  packingCandidates.erase(
+      std::remove_if(
+          packingCandidates.begin(), packingCandidates.end(),
+          [&](PackingAttributes &attr) {
+            if (!attr.getReadRegion()) {
+              LLVM_DEBUG(dbgs() << "[DEBUG] Candidate removed: Could not compute memRef "
+                                   "read regions or has only write region.\n");
+              return true;
+            }
+            return false;
+          }),
+      packingCandidates.end());
+  if (packingCandidates.empty()) {
+    LLVM_DEBUG(
+        dbgs() << "[DEBUG] Not packing, could not compute memRef regions.\n");
+    return;
+  }
 }
 
 void LoopPacking::runOnOperation() {
