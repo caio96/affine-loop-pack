@@ -355,6 +355,10 @@ public:
   DenseMap<Value, std::unique_ptr<MemRefRegion>> memRefReadRegion;
   /// Map from memref to it's write region
   DenseMap<Value, std::unique_ptr<MemRefRegion>> memRefWriteRegion;
+  /// Map from memref to its footprint in this forOp
+  DenseMap<Value, std::optional<int64_t>> memRefFootprintMap;
+  /// Map from memref to its footprint in one iteration of this forOp
+  DenseMap<Value, std::optional<int64_t>> memRefSingleIterationFootprintMap;
 
   PackingLoopInfo() = default;
 
@@ -401,6 +405,31 @@ public:
     }
     return this->memRefTileShapeMap[memRef];
   }
+
+  /// Returns footprint of a memref in this loop if available.
+  /// The result is computed only when requested and then stored.
+  std::optional<int64_t> getMemRefFootprint(Value memRef) {
+    if (this->memRefFootprintMap.count(memRef) == 0)
+      this->memRefFootprintMap[memRef] =
+          getMemoryFootprintBytes(this->forOp, /*memorySpace*/ 0, memRef);
+
+    return this->memRefFootprintMap[memRef];
+  }
+
+  /// Returns footprint of a memref in one iteration of this loop if available.
+  /// The result is computed only when requested and then stored.
+  std::optional<int64_t> getMemRefSingleIterationFootprint(Value memRef) {
+    if (this->memRefSingleIterationFootprintMap.count(memRef) == 0) {
+      // Get footprint of only the body of the loop
+      auto *forBodyBlock = this->forOp.getBody();
+
+      this->memRefSingleIterationFootprintMap[memRef] = getMemoryFootprintBytes(
+          *forBodyBlock, forBodyBlock->begin(), forBodyBlock->end(),
+          /*memorySpace*/ 0, memRef);
+    }
+
+    return this->memRefSingleIterationFootprintMap[memRef];
+  }
 };
 
 /// Information about a packing candidate.
@@ -415,6 +444,8 @@ public:
   /// Permutation vector, if it has a value, the packed buffer can be rearranged
   /// so its data layout correlates better with the current loop order.
   std::optional<SmallVector<size_t>> permutationOrder;
+  /// Footprint required so that the packed buffer is not evicted while reused.
+  std::optional<uint64_t> residencyFootprint;
 
   PackingAttributes(Value memRef, PackingLoopInfo &loop)
       : memRef(memRef), loop(&loop) {}
@@ -438,6 +469,10 @@ public:
 
   std::unique_ptr<MemRefRegion> &getWriteRegion() const {
     return this->loop->getMemRefWriteRegion(this->memRef);
+  }
+
+  std::optional<int64_t> getFootprint() const {
+    return this->loop->getMemRefFootprint(this->memRef);
   }
 
   void setPermutationOrder() {
@@ -524,6 +559,51 @@ public:
     // Set permutationOrder to std::nullopt if no permutation is needed.
     if (this->permutationOrder == identity)
       this->permutationOrder = std::nullopt;
+  }
+
+  /// Residency footprint is an approximation of space in cache necessary so the
+  /// packing remains in cache. The packing is reused at every iteration of the
+  /// invariant forOp. It will remain in cache if there is enough space for the
+  /// packing itself and for the other memrefs. Therefore residency footprint is
+  /// calculated with:
+  ///   - footprint of the packing
+  ///   - 2 * footprint of other memrefs used in one iteration of the invariant
+  ///   loop
+  /// Twice the footprint of other memrefs so that the packing is not evicted in
+  /// an LRU policy. If there are more children loops or if operations, this is
+  /// an over approximation. This function computes the residencyFootprint and
+  /// returns true, but if the residencyFootprint is not computable, it returns
+  /// false
+  bool setResidencyFootprint() {
+    if (!this->getFootprint().has_value() ||
+        this->getFootprint().value() == 0) {
+      this->residencyFootprint = std::nullopt;
+      return false;
+    }
+
+    // Get all memrefs in the target loop
+    SetVector<Value> memRefs;
+    getMemRefsInForOp(this->loop->forOp, memRefs, /*minRank=*/1);
+
+    uint64_t otherMemrefsFootprint = 0;
+
+    for (const auto &memRef : memRefs) {
+      if (this->memRef == memRef)
+        continue;
+
+      auto footprint = this->loop->getMemRefSingleIterationFootprint(memRef);
+      if (!footprint.has_value()) {
+        this->residencyFootprint = std::nullopt;
+        return false;
+      }
+
+      otherMemrefsFootprint += 2 * footprint.value();
+    }
+
+    this->residencyFootprint =
+        this->getFootprint().value() + otherMemrefsFootprint;
+
+    return true;
   }
 };
 
@@ -619,8 +699,9 @@ void LoopPacking::runOnOuterForOp(AffineForOp outerForOp,
             if (!attr.isContiguous().has_value() ||
                 (attr.isContiguous().value() &&
                  attr.permutationOrder == std::nullopt)) {
-              LLVM_DEBUG(dbgs() << "[DEBUG] Candidate removed: region is contiguous "
-                                   "and has no permutation.\n");
+              LLVM_DEBUG(dbgs()
+                         << "[DEBUG] Candidate removed: region is contiguous "
+                            "and has no permutation.\n");
               return true;
             }
             return false;
@@ -669,6 +750,34 @@ void LoopPacking::runOnOuterForOp(AffineForOp outerForOp,
       /*generateDMA=*/false, /*slowMemorySpace=*/0,
       /*fastMemorySpace=*/0, /*tagMemorySpace=*/0,
       /*fastMemCapacityBytes=*/cacheThresholdSizeInKiB * 1024};
+
+  // Remove packing options that could not compute residency footprints
+  // or that have a residency footprints bigger than cache threshold
+  packingCandidates.erase(
+      std::remove_if(
+          packingCandidates.begin(), packingCandidates.end(),
+          [&](PackingAttributes &attr) {
+            if (!attr.setResidencyFootprint()) {
+              LLVM_DEBUG(dbgs()
+                         << "[DEBUG] Candidate removed: could not compute "
+                            "footprint or residency footprint.\n");
+              return true;
+            }
+            if (attr.residencyFootprint.value() >
+                cacheThresholdSizeInKiB * 1024) {
+              LLVM_DEBUG(dbgs()
+                         << "[DEBUG] Candidate removed: residency footprint "
+                            "bigger than target level of cache.\n");
+              return true;
+            }
+            return false;
+          }),
+      packingCandidates.end());
+  if (packingCandidates.empty()) {
+    LLVM_DEBUG(dbgs() << "[DEBUG] Not packing, could not compute residency "
+                         "footprints, or residency footprint is too big.\n");
+    return;
+  }
 }
 
 void LoopPacking::runOnOperation() {
