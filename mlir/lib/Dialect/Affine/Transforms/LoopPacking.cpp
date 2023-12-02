@@ -633,6 +633,42 @@ void LoopPacking::runOnOuterForOp(AffineForOp outerForOp,
     return;
   }
 
+  // Get total footprint for the outerloop
+  std::optional<int64_t> totalFootprint =
+      getMemoryFootprintBytes(outerForOp, /*memorySpace=*/0);
+
+  // Set cache threshold.
+  uint64_t cacheThresholdSizeInKiB = this->l3CacheSizeInKiB;
+  // If the computation fits in one cache, consider only upper levels.
+  if (totalFootprint.has_value()) {
+    uint64_t totalFootprintValue =
+        static_cast<uint64_t>(totalFootprint.value());
+
+    // No need for packing if everything already fits in l1 cache.
+    if (totalFootprintValue < this->l1CacheSizeInKiB * 1024) {
+      LLVM_DEBUG(
+          dbgs() << "[DEBUG] Not packing, everything already fits in L1.\n");
+      return;
+    }
+
+    // Computation fits in L2.
+    if (totalFootprintValue < this->l2CacheSizeInKiB * 1024) {
+      cacheThresholdSizeInKiB = this->l1CacheSizeInKiB;
+      LLVM_DEBUG(dbgs() << "[DEBUG] Cache threshold set to L1.\n");
+      // Computation fits in L3.
+    } else if (totalFootprintValue < this->l3CacheSizeInKiB * 1024) {
+      cacheThresholdSizeInKiB = this->l2CacheSizeInKiB;
+      LLVM_DEBUG(dbgs() << "[DEBUG] Cache threshold set to L2.\n");
+      // Computation does not fit in L3.
+    } else {
+      LLVM_DEBUG(dbgs() << "[DEBUG] Cache threshold set to L3.\n");
+    }
+  }
+
+  AffineCopyOptions copyOptions = {
+      /*generateDMA=*/false, /*slowMemorySpace=*/0,
+      /*fastMemorySpace=*/0, /*tagMemorySpace=*/0,
+      /*fastMemCapacityBytes=*/cacheThresholdSizeInKiB * 1024};
 }
 
 void LoopPacking::runOnOperation() {
