@@ -149,6 +149,19 @@ static void getMemRefsInForOp(AffineForOp forOp, SetVector<Value> &memRefs,
   });
 }
 
+/// True if a loop is a parent of an operation.
+static bool isLoopParentOfOp(AffineForOp forOp, Operation *op) {
+  Operation *currOp = op;
+
+  while ((currOp = currOp->getParentOp())) {
+    if (auto currFor = dyn_cast<AffineForOp>(currOp)) {
+      if (currFor == forOp)
+        return true;
+    }
+  }
+  return false;
+}
+
 /// Check if a memRef is loaded in a forOp.
 static bool isMemRefLoadedInForOp(AffineForOp forOp, Value memRef) {
   auto walkRes = forOp.walk([&](Operation *op) {
@@ -340,6 +353,75 @@ static void computeTileShape(Value memRef,
   }
 }
 
+/// Get number of entries needed (in a TLB for example) to fit a tile of \p
+/// tileShape with elements of type \p memRefType in a memRef of shape \p
+/// memRefShape, given that each entry can fit \p entrySizeInB Bytes (for a TLB,
+/// each entry can address \p entrySizeInB Bytes).
+static std::optional<uint64_t> getEntriesNeeded(MemRefType memRefType,
+                                                ArrayRef<int64_t> memRefShape,
+                                                ArrayRef<int64_t> tileShape,
+                                                uint64_t entrySizeInB) {
+  assert(memRefShape.size() == tileShape.size());
+
+  auto typeSizeBytes = getMemRefIntOrFloatEltSizeInBytes(memRefType);
+  if (!typeSizeBytes)
+    return std::nullopt;
+
+  // Number of elements addressed in one (TLB) entry.
+  uint64_t elementsInEntry = floorDiv(entrySizeInB, typeSizeBytes.value());
+
+  // Find contiguous portion of the tile,
+  // the innermost dimension is always included.
+  int64_t contiguousDim = memRefShape.size() - 1;
+  while (contiguousDim >= 1 &&
+         tileShape[contiguousDim - 1] == memRefShape[contiguousDim - 1]) {
+    --contiguousDim;
+  }
+
+  // Count elements in contiguous portion.
+  uint64_t contiguousElems = 1;
+  for (size_t idx = contiguousDim; idx < memRefShape.size(); ++idx)
+    contiguousElems *= tileShape[idx];
+
+  // Get number of pages needed to address contiguous portion of the tile.
+  uint64_t entriesNeeded = ceilDiv(contiguousElems, elementsInEntry);
+
+  // Now for the dimension where the tile in not contiguous
+  int64_t remainingDims = contiguousDim - 1;
+
+  // Offset between the two elements obtained by incrementing an index
+  // at dimension remainingDim of the tile. For example, in a tensor
+  // A[4][4][4] with a tile A'[1][2][4], only the innermost dimension is
+  // contiguous and at this point remainingDims equals 1 and offset is equal to
+  // 4, which is the offset between A'[0][0][0] and A'[0][1][0].
+  uint64_t offset = 1;
+  for (size_t idx = remainingDims + 1; idx < memRefShape.size(); idx++)
+    offset *= memRefShape[idx];
+
+  while (remainingDims >= 0) {
+    // Check if a single page can address multiple contiguous portions (first
+    // while iteration) of the tile at once, e.g. if 512 elements fit in an
+    // entry, memref has dimensions 256x256, and tile 6x5, 3 entries are needed
+    // to fit the tile as each entry can fit 2 full rows of the memref.
+    uint64_t entriesOverflow =
+        ceilDiv(tileShape[remainingDims] * offset, elementsInEntry);
+
+    // Otherwise multiply the number entries needed for the contiguous portion
+    // (first while iteration) and multiply by the size of the tile
+    // dimension. 6 in the previous example.
+    uint64_t entriesNoOverflow = entriesNeeded * tileShape[remainingDims];
+
+    // Get the smallest one
+    entriesNeeded = std::min(entriesOverflow, entriesNoOverflow);
+
+    // Update offset and go to the next dim
+    offset *= memRefShape[remainingDims];
+    remainingDims--;
+  }
+
+  return entriesNeeded;
+}
+
 /// Stores information of an AffineForOp.
 class PackingLoopInfo {
 public:
@@ -446,12 +528,24 @@ public:
   std::optional<SmallVector<size_t>> permutationOrder;
   /// Footprint required so that the packed buffer is not evicted while reused.
   std::optional<uint64_t> residencyFootprint;
+  /// Number of TLB entries not required anymore after packing this candidate.
+  uint64_t tlbImprovement = 0;
 
   PackingAttributes(Value memRef, PackingLoopInfo &loop)
       : memRef(memRef), loop(&loop) {}
 
   ArrayRef<int64_t> getTileShape() const {
     return this->loop->getMemRefTileShape(this->memRef);
+  }
+
+  // Return the tile shape and applies the packing permutation
+  // to it if there is any
+  SmallVector<int64_t> getPackedShape() const {
+    auto tileShape = this->loop->getMemRefTileShape(this->memRef);
+    SmallVector<int64_t> packedShape{tileShape.begin(), tileShape.end()};
+    if (this->permutationOrder.has_value())
+      permuteWithIndexVector(packedShape, this->permutationOrder.value());
+    return packedShape;
   }
 
   std::optional<bool> isContiguous() const {
@@ -604,6 +698,168 @@ public:
         this->getFootprint().value() + otherMemrefsFootprint;
 
     return true;
+  }
+
+  /// Approximates TLB usage with and without packing this tile in forOp.
+  /// If this computation would not fit L1D TLB before packing
+  /// and it fits after packing, return the number of tlb entries packing saves.
+  /// Returns 0 otherwise.
+  /// PackedTiles defines a list of candidates that should be considered packed.
+  /// For them, the packed shape is considered instead of the original memRef
+  /// shape.
+  uint64_t improvesTLBUsage(
+      AffineForOp forOp, uint64_t tlbPageSizeInKiB, uint64_t tlbEntries,
+      SmallMapVector<AffineForOp, PackingLoopInfo, 4> &loopInfoMap,
+      ArrayRef<PackingAttributes *> packedCandidates = std::nullopt) {
+    // forOp must be either the target loop or a child loop of it
+    assert(isLoopParentOfOp(this->loop->forOp, forOp) ||
+           this->loop->forOp == forOp);
+
+    // Get all memRefs in forOp.
+    SetVector<Value> memRefs;
+    getMemRefsInForOp(forOp, memRefs, /*minRank=*/1);
+
+    // The target memRef may not be used in forOp
+    if (!memRefs.contains(this->memRef))
+      return 0;
+
+    // For every memRef used in this forOp, other than the target memRef,
+    // packing this candidate does not change the number of TLB entries
+    // that they use. Still, they are computed to check the L1 dTLB threshold
+    uint64_t entries = 0;
+    for (const auto &memRef : memRefs) {
+      if (memRef == this->memRef)
+        continue;
+
+      // Get memRef type
+      auto memRefType = memRef.getType().cast<MemRefType>();
+      // Get tile shape of memRef in forOp.
+      ArrayRef<int64_t> tileShape =
+          loopInfoMap[forOp].getMemRefTileShape(memRef);
+      if (tileShape.empty())
+        return 0;
+
+      // Check if the memRef is already packed
+      PackingAttributes *packed = nullptr;
+      for (auto *packing : packedCandidates) {
+        if (packing->memRef == memRef &&
+            (packing->loop->forOp == forOp ||
+             isLoopParentOfOp(packing->loop->forOp, forOp))) {
+          packed = packing;
+          break;
+        }
+      }
+
+      // If the memRef is not packed, add the entries needed
+      // for its tile in this loop, given the original memRefShape
+      if (!packed) {
+        ArrayRef<int64_t> memRefShape = memRefType.getShape();
+        auto memRefEntries = getEntriesNeeded(
+            memRefType, memRefShape, tileShape, 1024 * tlbPageSizeInKiB);
+        if (!memRefEntries.has_value())
+          return 0;
+        entries += memRefEntries.value();
+
+        // If packed, add the entries needed
+        // for its tile in this loop, given the packing shape
+      } else {
+        // Get packed shape (already permuted if there is a permutation)
+        auto packedShape = packed->getPackedShape();
+        if (packedShape.empty())
+          return 0;
+
+        // Get tile shape and permuted it if there is a permutation
+        SmallVector<int64_t> updatedTileShape{tileShape.begin(),
+                                              tileShape.end()};
+        if (packed->permutationOrder.has_value())
+          permuteWithIndexVector(updatedTileShape,
+                                 packed->permutationOrder.value());
+
+        auto memRefEntries = getEntriesNeeded(
+            memRefType, packedShape, updatedTileShape, 1024 * tlbPageSizeInKiB);
+        if (!memRefEntries)
+          return 0;
+        entries += memRefEntries.value();
+      }
+    }
+
+    uint64_t entriesPacking = entries;
+    uint64_t entriesNoPacking = entries;
+
+    // Now consider the memref of this candidate,
+    // which will use a different number of entries
+    // if it is packed of not
+
+    // Get memRef type and shape
+    auto memRefType = this->memRef.getType().cast<MemRefType>();
+    ArrayRef<int64_t> memRefShape = memRefType.getShape();
+    // Get tile shape of memRef in forOp.
+    ArrayRef<int64_t> tileShape =
+        loopInfoMap[forOp].getMemRefTileShape(this->memRef);
+    if (tileShape.empty())
+      return 0;
+    // Packed shape is the tile shape of the candidate
+    auto packedShape = this->getPackedShape();
+    if (packedShape.empty())
+      return 0;
+    // Get tile shape and permuted it if there is a permutation
+    SmallVector<int64_t> updatedTileShape{tileShape.begin(), tileShape.end()};
+    if (this->permutationOrder.has_value())
+      permuteWithIndexVector(updatedTileShape, this->permutationOrder.value());
+
+    // Compute entries packing this candidate
+    std::optional<uint64_t> memRefEntries = getEntriesNeeded(
+        memRefType, packedShape, updatedTileShape, 1024 * tlbPageSizeInKiB);
+    if (!memRefEntries)
+      return 0;
+    entriesPacking += memRefEntries.value();
+
+    // Compute entries not packing this candidate
+    memRefEntries = getEntriesNeeded(memRefType, memRefShape, tileShape,
+                                     1024 * tlbPageSizeInKiB);
+    if (!memRefEntries)
+      return 0;
+    entriesNoPacking += memRefEntries.value();
+
+    // If before packing this loop did not fit the tlb, and
+    // after packing it fits, return improvement
+    if (entriesNoPacking > tlbEntries && entriesPacking <= tlbEntries)
+      return entriesNoPacking - entriesPacking;
+
+    // Otherwise return 0
+    return 0;
+  }
+
+  // This function multiplies the tlb improvement on a loop by the number of
+  // times the loop is run inside the target loop. This is done for the target
+  // loop and its inner loops. It returns the tlb improvement.
+  uint64_t setTLBImprovement(
+      uint64_t l1dtlbPageSizeInKiB, uint64_t l1dtlbEntries,
+      SmallMapVector<AffineForOp, PackingLoopInfo, 4> &loopInfoMap,
+      ArrayRef<PackingAttributes *> packedTiles = std::nullopt) {
+
+    this->loop->forOp.walk([&](AffineForOp forOp) {
+      uint64_t improvement = this->improvesTLBUsage(
+          forOp, l1dtlbPageSizeInKiB, l1dtlbEntries, loopInfoMap, packedTiles);
+
+      // Multiply improvement by the number of times this loop is run.
+      Operation *currOp = forOp;
+      while ((currOp = currOp->getParentOp())) {
+        // The target loop does not multiply the improvement
+        if (currOp == this->loop->forOp->getParentOp())
+          break;
+
+        // If the trip count has no value, the improvement
+        // will not be multiplied by the trip count
+        if (auto currFor = dyn_cast<AffineForOp>(currOp))
+          if (loopInfoMap[currFor].tripCount.has_value())
+            improvement *= loopInfoMap[currFor].tripCount.value();
+      }
+
+      this->tlbImprovement += improvement;
+    });
+
+    return this->tlbImprovement;
   }
 };
 
@@ -776,6 +1032,26 @@ void LoopPacking::runOnOuterForOp(AffineForOp outerForOp,
   if (packingCandidates.empty()) {
     LLVM_DEBUG(dbgs() << "[DEBUG] Not packing, could not compute residency "
                          "footprints, or residency footprint is too big.\n");
+    return;
+  }
+
+  // Remove packing options that do not improve TLB use.
+  packingCandidates.erase(
+      std::remove_if(
+          packingCandidates.begin(), packingCandidates.end(),
+          [&](PackingAttributes &attr) {
+            if (attr.setTLBImprovement(this->l1dtlbPageSizeInKiB,
+                                       this->l1dtlbEntries, loopInfoMap) == 0) {
+              LLVM_DEBUG(dbgs()
+                         << "[DEBUG] Candidate removed: does not improve TLB "
+                            "usage.\n");
+              return true;
+            }
+            return false;
+          }),
+      packingCandidates.end());
+  if (packingCandidates.empty()) {
+    LLVM_DEBUG(dbgs() << "[DEBUG] Not packing, does not improve tlb usage.\n");
     return;
   }
 }
