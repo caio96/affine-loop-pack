@@ -530,6 +530,8 @@ public:
   std::optional<uint64_t> residencyFootprint;
   /// Number of TLB entries not required anymore after packing this candidate.
   uint64_t tlbImprovement = 0;
+  /// True if permutation improves the indexing of an innermost loop IV.
+  bool innermostLoopIVPermutation = false;
 
   PackingAttributes(Value memRef, PackingLoopInfo &loop)
       : memRef(memRef), loop(&loop) {}
@@ -653,6 +655,90 @@ public:
     // Set permutationOrder to std::nullopt if no permutation is needed.
     if (this->permutationOrder == identity)
       this->permutationOrder = std::nullopt;
+  }
+
+  // This function checks if the permutation improves the indexing
+  // of an innermost loop IV. However, the elements of the innermost
+  // dimension must be bigger than two lines of cache. It stores the result
+  // in innermostLoopIVPermutation and also returns the result.
+  bool setInnermostLoopIVPermutation(uint64_t cacheLineSizeInB) {
+    this->innermostLoopIVPermutation = false;
+
+    // Check if there is permutation.
+    if (!this->permutationOrder.has_value())
+      return this->innermostLoopIVPermutation;
+
+    auto tileShape = this->getTileShape();
+    if (tileShape.empty()) {
+      return this->innermostLoopIVPermutation;
+    }
+
+    this->loop->forOp.walk([&](Operation *op) {
+      // Get stores and loads related affected by this packing.
+      if (auto loadOp = dyn_cast<AffineLoadOp>(op)) {
+        if (this->memRef != loadOp.getMemRef())
+          return WalkResult::advance();
+        // Give up on non-trivial layout map.
+        if (!loadOp.getMemRefType().getLayout().isIdentity()) {
+          this->permutationOrder = std::nullopt;
+          return WalkResult::interrupt();
+        }
+      } else if (auto storeOp = dyn_cast<AffineStoreOp>(op)) {
+        if (this->memRef != storeOp.getMemRef())
+          return WalkResult::advance();
+        // Give up on non-trivial layout map.
+        if (!storeOp.getMemRefType().getLayout().isIdentity()) {
+          this->permutationOrder = std::nullopt;
+          return WalkResult::interrupt();
+        }
+      } else {
+        return WalkResult::advance();
+      }
+
+      // Get access map of load/store.
+      MemRefAccess access(op);
+      AffineValueMap map;
+      access.getAccessMap(&map);
+
+      // Check if an operand that uses the IV of an innermost loop
+      // is permuted to an to an inner dimension
+      for (unsigned int resultIdx = 0; resultIdx < map.getNumResults();
+           resultIdx++) {
+        for (auto operand : map.getOperands()) {
+          if (isAffineForInductionVar(operand) &&
+              map.isFunctionOf(resultIdx, operand)) {
+            AffineForOp ownerForOp = getForInductionVarOwner(operand);
+            if (isInnermostAffineForOp(ownerForOp) &&
+                this->permutationOrder.value()[resultIdx] != resultIdx) {
+              this->innermostLoopIVPermutation = true;
+              return WalkResult::interrupt();
+            }
+          }
+        }
+      }
+
+      return WalkResult::advance();
+    });
+
+    // Verify that the innermost dimension is at least two cache lines long.
+    // Otherwise, ignore innermost loop permutation.
+    if (this->innermostLoopIVPermutation) {
+      auto packedShape = this->getPackedShape();
+      auto innermostElements = packedShape.back();
+      auto memRefType = this->memRef.getType().cast<MemRefType>();
+
+      auto typeSizeBytes = getMemRefIntOrFloatEltSizeInBytes(memRefType);
+      if (!typeSizeBytes.has_value()){
+        this->innermostLoopIVPermutation = false;
+        return this->innermostLoopIVPermutation;
+      }
+
+      if (innermostElements * typeSizeBytes.value() <
+          2 * static_cast<int64_t>(cacheLineSizeInB))
+        this->innermostLoopIVPermutation = false;
+    }
+
+    return this->innermostLoopIVPermutation;
   }
 
   /// Residency footprint is an approximation of space in cache necessary so the
@@ -1041,17 +1127,19 @@ void LoopPacking::runOnOuterForOp(AffineForOp outerForOp,
           packingCandidates.begin(), packingCandidates.end(),
           [&](PackingAttributes &attr) {
             if (attr.setTLBImprovement(this->l1dtlbPageSizeInKiB,
-                                       this->l1dtlbEntries, loopInfoMap) == 0) {
+                                       this->l1dtlbEntries, loopInfoMap) == 0 &&
+                !attr.setInnermostLoopIVPermutation(this->cacheLineSizeInB)) {
               LLVM_DEBUG(dbgs()
                          << "[DEBUG] Candidate removed: does not improve TLB "
-                            "usage.\n");
+                            "usage and has no innermost loop permutation.\n");
               return true;
             }
             return false;
           }),
       packingCandidates.end());
   if (packingCandidates.empty()) {
-    LLVM_DEBUG(dbgs() << "[DEBUG] Not packing, does not improve tlb usage.\n");
+    LLVM_DEBUG(dbgs() << "[DEBUG] Not packing, does not improve tlb usage "
+                         "and have no innermost permutation\n");
     return;
   }
 }
