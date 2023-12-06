@@ -532,6 +532,8 @@ public:
   uint64_t tlbImprovement = 0;
   /// True if permutation improves the indexing of an innermost loop IV.
   bool innermostLoopIVPermutation = false;
+  /// Ratio that approximates the benefit/cost of packing this candidate.
+  std::optional<double> gainCostRatio;
 
   PackingAttributes(Value memRef, PackingLoopInfo &loop)
       : memRef(memRef), loop(&loop) {}
@@ -947,6 +949,43 @@ public:
 
     return this->tlbImprovement;
   }
+
+  /// Calculates how beneficial it is to apply this packing candidate.
+  void setGainCostRatio(uint64_t cacheLineSizeInB) {
+    // Get memRef and tile shape.
+    auto memRefType = this->memRef.getType().cast<MemRefType>();
+    auto tileShape = this->getTileShape();
+    if (tileShape.empty())
+      return;
+    ArrayRef<int64_t> memRefShape = memRefType.getShape();
+
+    // Get size of elements in the tile
+    auto typeSizeBytes = getMemRefIntOrFloatEltSizeInBytes(memRefType);
+    if (!typeSizeBytes)
+      return;
+
+    // Number of elements that fit in one cache line.
+    uint64_t elementsInCacheLine =
+        floorDiv(cacheLineSizeInB, typeSizeBytes.value());
+    // How many cache lines are needed for the tile
+    auto cacheLines = getEntriesNeeded(memRefType, memRefShape,
+                                       tileShape, cacheLineSizeInB);
+    if (!cacheLines)
+      return;
+
+    // Cost: number of cache lines needed for packing the tile
+    //       (multiplied by two if it needs unpacking)
+    uint64_t cost = cacheLines.value() * elementsInCacheLine;
+    if (this->getWriteRegion()) {
+      cost *= 2;
+    }
+
+    // Gain: reuse factor (trip count) * TLB entries saved
+    uint64_t gain = this->tlbImprovement;
+
+    assert(cost != 0 && "Cost should not be zero.");
+    this->gainCostRatio = static_cast<double>(gain) / static_cast<double>(cost);
+  }
 };
 
 /// Analyse and apply packing to a loop and its nestings.
@@ -1142,6 +1181,10 @@ void LoopPacking::runOnOuterForOp(AffineForOp outerForOp,
                          "and have no innermost permutation\n");
     return;
   }
+
+  // Set gain/cost ratio of each candidate.
+  for (auto &packing : packingCandidates)
+    packing.setGainCostRatio(this->cacheLineSizeInB);
 }
 
 void LoopPacking::runOnOperation() {
