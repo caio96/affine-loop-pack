@@ -19,7 +19,9 @@
 #include "mlir/Dialect/Affine/LoopUtils.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "llvm/ADT/SmallSet.h"
 #include "llvm/Support/Debug.h"
+#include "llvm/Support/Format.h"
 
 namespace mlir {
 namespace affine {
@@ -32,6 +34,7 @@ using namespace mlir;
 using namespace mlir::affine;
 using llvm::dbgs;
 using llvm::SmallMapVector;
+using llvm::SmallSet;
 
 #define DEBUG_TYPE "affine-loop-pack"
 
@@ -512,6 +515,23 @@ public:
 
     return this->memRefSingleIterationFootprintMap[memRef];
   }
+
+  void dump() {
+    LLVM_DEBUG(dbgs() << "    Affine ForOp Information:\n");
+    LLVM_DEBUG(dbgs() << "        LoopIV location: "
+                      << this->forOp.getInductionVar().getLoc() << "\n");
+    LLVM_DEBUG(dbgs() << "        Upper map: " << this->forOp.getUpperBoundMap()
+                      << "\n");
+    LLVM_DEBUG(dbgs() << "        Lower map: " << this->forOp.getLowerBoundMap()
+                      << "\n");
+    LLVM_DEBUG(dbgs() << "        Depth: " << this->depth << "\n");
+    if (this->tripCount.has_value()) {
+      LLVM_DEBUG(dbgs() << "        TripCount: " << this->tripCount.value()
+                        << "\n");
+    } else {
+      LLVM_DEBUG(dbgs() << "        TripCount: unknown\n");
+    }
+  }
 };
 
 /// Information about a packing candidate.
@@ -571,6 +591,39 @@ public:
 
   std::optional<int64_t> getFootprint() const {
     return this->loop->getMemRefFootprint(this->memRef);
+  }
+
+  // Order is based on gain/cost ratio of packings and loop depth.
+  bool operator<(const PackingAttributes &other) const {
+    if (this->gainCostRatio.has_value() && other.gainCostRatio.has_value()) {
+      if (this->gainCostRatio.value() != other.gainCostRatio.value())
+        return this->gainCostRatio.value() < other.gainCostRatio.value();
+    } else if (this->gainCostRatio.has_value() &&
+               !other.gainCostRatio.has_value()) {
+      return false;
+    } else if (!this->gainCostRatio.has_value() &&
+               other.gainCostRatio.has_value()) {
+      return true;
+    }
+    // If the gain/cost order fails or ties, order packing based
+    // on loop depth. Lower depth is preferred because it means the
+    // packing has a larger target region.
+    return this->loop->depth > other.loop->depth;
+  }
+
+  bool operator>(const PackingAttributes &other) const { return other < *this; }
+
+  // Returns true if this packing is redundant with another
+  // packing, meaning that they both pack the same memRef
+  // the their target loops overlap.
+  bool isRedundantWith(PackingAttributes &other) {
+    if (this->memRef == other.memRef) {
+      if (isLoopParentOfOp(other.loop->forOp, this->loop->forOp) ||
+          isLoopParentOfOp(this->loop->forOp, other.loop->forOp)) {
+        return true;
+      }
+    }
+    return false;
   }
 
   void setPermutationOrder() {
@@ -986,6 +1039,79 @@ public:
     assert(cost != 0 && "Cost should not be zero.");
     this->gainCostRatio = static_cast<double>(gain) / static_cast<double>(cost);
   }
+
+  void dump() const {
+    LLVM_DEBUG(dbgs() << "[Packing Candidate]\n");
+
+    if (this->id != -1)
+      LLVM_DEBUG(dbgs() << "    Id: " << this->id << "\n");
+
+    LLVM_DEBUG(dbgs() << "    MemRef: " << this->memRef << "\n");
+
+    this->loop->dump();
+
+    LLVM_DEBUG(dbgs() << "    Tile shape: ");
+    if (this->getTileShape().empty()) {
+      LLVM_DEBUG(dbgs() << " unknown ");
+    } else {
+      for (auto i : this->getTileShape())
+        LLVM_DEBUG(dbgs() << i << " ");
+    }
+    LLVM_DEBUG(dbgs() << "\n");
+
+    if (this->permutationOrder.has_value()) {
+      LLVM_DEBUG(dbgs() << "    Permutation: ");
+      for (auto i : this->permutationOrder.value())
+        LLVM_DEBUG(dbgs() << i << " ");
+      LLVM_DEBUG(dbgs() << "\n");
+
+      LLVM_DEBUG(dbgs() << "    Packed shape: ");
+      if (this->getPackedShape().empty()) {
+        LLVM_DEBUG(dbgs() << " unknown ");
+      } else {
+        for (auto i : this->getPackedShape())
+          LLVM_DEBUG(dbgs() << i << " ");
+      }
+      LLVM_DEBUG(dbgs() << "\n");
+
+      LLVM_DEBUG(dbgs() << "    Permutes innermost loop IV: "
+                        << this->innermostLoopIVPermutation << "\n");
+    } else {
+      LLVM_DEBUG(dbgs() << "    Permutation: None");
+    }
+
+    if (this->isContiguous().has_value()) {
+      LLVM_DEBUG(dbgs() << "    Contiguous: " << this->isContiguous().value()
+                        << "\n");
+    } else {
+      LLVM_DEBUG(dbgs() << "    Contiguous: unknown\n");
+    }
+
+    if (this->getFootprint().has_value()) {
+      LLVM_DEBUG(dbgs() << "    Footprint: " << this->getFootprint().value()
+                        << "\n");
+    } else {
+      LLVM_DEBUG(dbgs() << "    Footprint: unknown\n");
+    }
+
+    if (this->residencyFootprint.has_value()) {
+      LLVM_DEBUG(dbgs() << "    Residency footprint: "
+                        << this->residencyFootprint.value() << "\n");
+    } else {
+      LLVM_DEBUG(dbgs() << "    Residency footprint: unknown\n");
+    }
+
+    LLVM_DEBUG(dbgs() << "    TLB improvement: " << this->tlbImprovement
+                      << "\n");
+
+    if (this->gainCostRatio.has_value()) {
+      LLVM_DEBUG(dbgs() << "    GainCostRatio: "
+                        << llvm::format("%.8f", this->gainCostRatio.value())
+                        << "\n");
+    } else {
+      LLVM_DEBUG(dbgs() << "    GainCostRatio: unknown\n");
+    }
+  }
 };
 
 /// Analyse and apply packing to a loop and its nestings.
@@ -1183,8 +1309,70 @@ void LoopPacking::runOnOuterForOp(AffineForOp outerForOp,
   }
 
   // Set gain/cost ratio of each candidate.
-  for (auto &packing : packingCandidates)
+  for (auto &packing : packingCandidates) {
     packing.setGainCostRatio(this->cacheLineSizeInB);
+  }
+
+  // Sort the packing options from best to worst options
+  // according to their gain/cost and loop depth.
+  llvm::stable_sort(packingCandidates, std::greater<PackingAttributes>());
+  // Give each candidates an ID
+  int counter = 1;
+  for (auto &packing : packingCandidates) {
+    packing.id = counter++;
+  }
+
+  // Store final packing selection.
+  SmallVector<PackingAttributes *> packingSelection;
+
+  // User selected packings
+  if (!this->packingOptions.empty()) {
+
+    // Print candidates if the option is -1
+    if (this->packingOptions.size() == 1 && this->packingOptions[0] == -1) {
+      LLVM_DEBUG(dbgs() << "---------------------------------------------"
+                        << "\n");
+      for (auto &packing : packingCandidates)
+        packing.dump();
+      LLVM_DEBUG(dbgs() << "---------------------------------------------"
+                        << "\n");
+      return;
+    }
+
+    // Verify that candidates selected exist
+    for (auto opt : this->packingOptions) {
+      if (opt <= 0 || opt >= counter) {
+        LLVM_DEBUG(
+            dbgs()
+            << "[ERROR] Invalid packing candidates was manually selected: "
+            << opt << "\n");
+        return signalPassFailure();
+      }
+    }
+
+    // Put user-selected packing in a set to avoid duplicates.
+    SmallSet<int32_t, 4> options;
+    for (auto opt : this->packingOptions)
+      options.insert(opt);
+
+    // Add user-selected packings
+    for (auto &packing : packingCandidates) {
+      if (options.contains(packing.id)) {
+        // Check if selecting this packing would be redundant.
+        for (auto *selected : packingSelection) {
+          if (selected->isRedundantWith(packing)) {
+            LLVM_DEBUG(
+                dbgs()
+                << "[ERROR] The same MemRef was selected to be packed twice "
+                   "in overlapping loops (options "
+                << packing.id << " and " << selected->id << ")" << "\n");
+            return signalPassFailure();
+          }
+        }
+        packingSelection.push_back(&packing);
+      }
+    }
+  }
 }
 
 void LoopPacking::runOnOperation() {
