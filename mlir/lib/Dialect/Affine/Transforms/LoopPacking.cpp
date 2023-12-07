@@ -1372,7 +1372,40 @@ void LoopPacking::runOnOuterForOp(AffineForOp outerForOp,
         packingSelection.push_back(&packing);
       }
     }
+  // Greedy approach to select packings:
+  // Tries to select all remaining candidates starting from
+  // best to worst. Does not pack if a candidate is redundant
+  // to another that was already selected.
+  } else {
+    for (auto &packing : packingCandidates) {
+      // Recalculate TLB improvement considering packings
+      // that were already selected
+      if (!packingSelection.empty()) {
+        packing.setTLBImprovement(this->l1dtlbPageSizeInKiB, this->l1dtlbEntries,
+                                  loopInfoMap, packingSelection);
+        // Do not pack if no improvement and no permutation on innermost loop IV.
+        if (packing.tlbImprovement == 0 && !packing.innermostLoopIVPermutation)
+          continue;
+      }
+
+      // Should only pack if selected packings are not redundant.
+      bool shouldPack = true;
+      for (auto *selected : packingSelection) {
+        if (selected->isRedundantWith(packing)) {
+          shouldPack = false;
+          break;
+        }
+      }
+      if (shouldPack)
+        packingSelection.push_back(&packing);
+    }
   }
+
+  // Print selected packings
+  LLVM_DEBUG(dbgs() << "[Packing Selection]--------------------------\n");
+  for (const auto *packing : packingSelection)
+    packing->dump();
+  LLVM_DEBUG(dbgs() << "---------------------------------------------\n");
 }
 
 void LoopPacking::runOnOperation() {
