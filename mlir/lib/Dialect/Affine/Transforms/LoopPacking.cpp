@@ -425,6 +425,59 @@ static std::optional<uint64_t> getEntriesNeeded(MemRefType memRefType,
   return entriesNeeded;
 }
 
+/// Applies the packing transformation.
+/// An inital copy loop is created for the readRegion. If a copy loop is
+/// inserted for a tensor that is written to, i.e., has a writeRegion,
+/// then there is a subsequent 'uncopying' loop to update the original
+/// values in memory. The uses of the original memref is the target
+/// forOp are substituted by the packed memref. Also applies the packing
+/// permutation if there is one.
+static LogicalResult generatePackings(
+    Value memRef, Operation *forOp, std::unique_ptr<MemRefRegion> &readRegion,
+    std::unique_ptr<MemRefRegion> &writeRegion,
+    DenseSet<Operation *> &copyNests, AffineCopyOptions &copyOptions,
+    ArrayRef<size_t> permutationOrder) {
+
+  DenseMap<Value, Value> fastBufferMap;
+
+  Block::iterator begin = Block::iterator(forOp);
+  Block::iterator end = std::next(Block::iterator(forOp));
+  Block *block = begin->getBlock();
+
+  LogicalResult ret = success();
+
+  auto processRegions = [&](const std::unique_ptr<MemRefRegion> &region) {
+    if (!region)
+      return;
+
+    Block::iterator copyInPlacementStart, copyOutPlacementStart;
+    Block *copyPlacementBlock;
+
+    copyInPlacementStart = begin;
+    copyOutPlacementStart = end;
+    copyPlacementBlock = block;
+
+    uint64_t sizeInBytes;
+    Block::iterator nBegin, nEnd;
+    LogicalResult iRet = generateCopy(
+        *region, block, begin, end, copyPlacementBlock, copyInPlacementStart,
+        copyOutPlacementStart, copyOptions, fastBufferMap, copyNests,
+        &sizeInBytes, &nBegin, &nEnd, permutationOrder);
+    if (succeeded(iRet)) {
+      // begin/end could have been invalidated, and need update.
+      begin = nBegin;
+      end = nEnd;
+    } else {
+      ret = failure();
+    }
+  };
+
+  processRegions(readRegion);
+  processRegions(writeRegion);
+
+  return ret;
+}
+
 /// Stores information of an AffineForOp.
 class PackingLoopInfo {
 public:
@@ -1406,6 +1459,26 @@ void LoopPacking::runOnOuterForOp(AffineForOp outerForOp,
   for (const auto *packing : packingSelection)
     packing->dump();
   LLVM_DEBUG(dbgs() << "---------------------------------------------\n");
+
+  // For each memref, the packs are generated at the found hoisting locations.
+  for (const auto *packing : packingSelection) {
+    ArrayRef<size_t> permutation;
+    if (packing->permutationOrder.has_value())
+      permutation = packing->permutationOrder.value();
+
+    if (failed(generatePackings(packing->memRef, packing->loop->forOp,
+                                packing->getReadRegion(),
+                                packing->getWriteRegion(), copyNests,
+                                copyOptions, permutation))) {
+      LLVM_DEBUG(dbgs() << "[DEBUG] Failed to generate packing"
+                        << packing->id
+                        << "\n");
+    } else {
+      LLVM_DEBUG(dbgs() << "[DEBUG] Succeeded generating packing "
+                        << packing->id
+                        << "\n");
+    }
+  }
 }
 
 void LoopPacking::runOnOperation() {
